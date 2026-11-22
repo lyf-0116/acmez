@@ -182,6 +182,12 @@ func (c *Client) ObtainCertificate(ctx context.Context, params OrderParameters) 
 		return nil, fmt.Errorf("solving challenges: %w (order=%s)", err, order.Location)
 	}
 
+	if err != nil {
+		// the loop can only exit with a non-nil error here if we ran
+		// out of attempts while the error was still retryable
+		return nil, err
+	}
+
 	if c.Logger != nil {
 		c.Logger.Info("validations succeeded; finalizing order", slog.String("order", order.Location))
 	}
@@ -266,6 +272,11 @@ func (c *Client) getAuthzObjects(ctx context.Context, account acme.Account, orde
 	var authzStates []*authzState
 	var err error
 
+	// challenge type statistics are scoped to this CA and account, so
+	// that experience with one issuer or account doesn't skew the
+	// challenge type preference of another
+	scope := c.challengeStatsScope(account)
+
 	// start by allowing each authz's solver to present for its challenge
 	for _, authzURL := range order.Authorizations {
 		authz := &authzState{account: account}
@@ -279,18 +290,20 @@ func (c *Client) getAuthzObjects(ctx context.Context, account acme.Account, orde
 		// choose the most successful challenge type over time;
 		// if initial fill, randomize challenge order
 		preferredChallengesMu.Lock()
-		preferredWasEmpty := len(preferredChallenges) == 0
+		preferred := preferredChallenges[scope]
+		preferredWasEmpty := len(preferred) == 0
 		for _, chal := range authz.Challenges {
-			preferredChallenges.addUnique(chal.Type)
+			preferred.addUnique(chal.Type)
 		}
 		if preferredWasEmpty {
 			randomSourceMu.Lock()
-			randomSource.Shuffle(len(preferredChallenges), func(i, j int) {
-				preferredChallenges[i], preferredChallenges[j] =
-					preferredChallenges[j], preferredChallenges[i]
+			randomSource.Shuffle(len(preferred), func(i, j int) {
+				preferred[i], preferred[j] =
+					preferred[j], preferred[i]
 			})
 			randomSourceMu.Unlock()
 		}
+		preferredChallenges[scope] = preferred
 		preferredChallengesMu.Unlock()
 
 		// copy over any challenges that are not known to have already
@@ -342,10 +355,16 @@ func (c *Client) solveChallenges(ctx context.Context, account acme.Account, orde
 		}
 
 		// if this function returns with an error, make sure to deactivate
-		// all pending or valid authorization objects so they don't "leak"
+		// all pending authorization objects so they don't "leak"
 		// See: https://github.com/go-acme/lego/issues/383 and https://github.com/go-acme/lego/issues/353
+		//
+		// authorizations that are already valid - including any that were
+		// successfully validated during this round - are deliberately left
+		// alone: a retry creates a new order, and the server can reuse
+		// still-valid authorizations for it, sparing us from re-validating
+		// every identifier on the next attempt
 		for _, authz := range authzStates {
-			if authz.Status != acme.StatusPending && authz.Status != acme.StatusValid {
+			if authz.Status != acme.StatusPending {
 				continue
 			}
 			updatedAuthz, err := c.Client.DeactivateAuthorization(ctx, account, authz.Location)
@@ -505,7 +524,7 @@ func (c *Client) nextChallenge(authz *authzState) error {
 
 	// find the most-preferred challenge that is also in the list of
 	// remaining challenges, then make sure we have a solver for it
-	for _, prefChalType := range preferredChallenges {
+	for _, prefChalType := range preferredChallenges[c.challengeStatsScope(authz.account)] {
 		for i, remainingChal := range authz.remainingChallenges {
 			if remainingChal.Type != prefChalType.typeName {
 				continue
@@ -549,7 +568,10 @@ func (c *Client) pollAuthorization(ctx context.Context, account acme.Account, au
 	if authz.currentSolver != nil {
 		// increment the statistics on this challenge type before handling error
 		preferredChallengesMu.Lock()
-		preferredChallenges.increment(authz.currentChallenge.Type, err == nil)
+		scope := c.challengeStatsScope(account)
+		preferred := preferredChallenges[scope]
+		preferred.increment(authz.currentChallenge.Type, err == nil)
+		preferredChallenges[scope] = preferred
 		preferredChallengesMu.Unlock()
 
 		// always clean up the challenge solver after polling, regardless of error
@@ -577,12 +599,7 @@ func (c *Client) pollAuthorization(ctx context.Context, account acme.Account, au
 			failedChallengeTypes.rememberFailedChallenge(authz)
 
 			if c.countAvailableChallenges(authz) > 0 {
-				switch problem.Type {
-				case acme.ProblemTypeConnection,
-					acme.ProblemTypeDNS,
-					acme.ProblemTypeServerInternal,
-					acme.ProblemTypeUnauthorized,
-					acme.ProblemTypeTLS:
+				if problemMayBeCausedByChallengeType(problem.Type) {
 					// this error might be recoverable with another challenge type
 					return retryableErr{err}
 				}
@@ -652,11 +669,15 @@ type challengeHistory struct {
 	successes, total int
 }
 
+// successRatio returns the smoothed success ratio of the challenge type.
+// Additive (Laplace) smoothing with a uniform prior keeps types with no
+// observations at a neutral 0.5 - below a type that has actually
+// succeeded, but above one that has actually failed - and keeps a single
+// failure from sinking an otherwise untried or well-proven type to the
+// bottom of the preference list.
 func (ch challengeHistory) successRatio() float64 {
-	if ch.total == 0 {
-		return 1.0
-	}
-	return float64(ch.successes) / float64(ch.total)
+	const priorSuccesses, priorTotal = 1, 2
+	return float64(ch.successes+priorSuccesses) / float64(ch.total+priorTotal)
 }
 
 // failedChallengeMap keeps track of failed challenge types per identifier.
@@ -736,9 +757,55 @@ type retryableErr struct{ error }
 
 func (re retryableErr) Unwrap() error { return re.error }
 
-// Keep a list of challenges we've seen offered by servers, ordered by success rate.
+// problemMayBeCausedByChallengeType reports whether a problem of the given
+// type could plausibly have been caused by the choice of challenge type,
+// such that retrying with a different challenge type is worthwhile. Problem
+// types that are unrelated to how a challenge is validated (rate limits,
+// rejected identifiers, malformed requests, account or CSR issues, etc.)
+// will not be fixed by switching challenge types, so they are not retried;
+// anything else - including incorrectResponse, the canonical "another
+// challenge type might work" failure - is worth another attempt.
+func problemMayBeCausedByChallengeType(problemType string) bool {
+	switch problemType {
+	case acme.ProblemTypeAccountDoesNotExist,
+		acme.ProblemTypeAlreadyReplaced,
+		acme.ProblemTypeAlreadyRevoked,
+		acme.ProblemTypeBadCSR,
+		acme.ProblemTypeBadNonce,
+		acme.ProblemTypeBadPublicKey,
+		acme.ProblemTypeBadRevocationReason,
+		acme.ProblemTypeBadSignatureAlgorithm,
+		acme.ProblemTypeCAA,
+		acme.ProblemTypeExternalAccountRequired,
+		acme.ProblemTypeInvalidContact,
+		acme.ProblemTypeMalformed,
+		acme.ProblemTypeOrderNotReady,
+		acme.ProblemTypeRateLimited,
+		acme.ProblemTypeRejectedIdentifier,
+		acme.ProblemTypeUnsupportedContact,
+		acme.ProblemTypeUnsupportedIdentifier,
+		acme.ProblemTypeUserActionRequired:
+		return false
+	}
+	return true
+}
+
+// challengeStatsScope identifies the scope that challenge type statistics
+// apply to: a specific account at a specific CA (directory). Success rates
+// are not shared across scopes, since different CAs offer different
+// challenge types and different accounts have different network postures.
+type challengeStatsScope struct {
+	directory, account string
+}
+
+func (c *Client) challengeStatsScope(account acme.Account) challengeStatsScope {
+	return challengeStatsScope{directory: c.Directory, account: account.Location}
+}
+
+// Keep, per CA-and-account scope, a list of challenges we've seen offered
+// by servers, ordered by (smoothed) success rate.
 var (
-	preferredChallenges   challengeTypes
+	preferredChallenges   = make(map[challengeStatsScope]challengeTypes)
 	preferredChallengesMu sync.Mutex
 )
 

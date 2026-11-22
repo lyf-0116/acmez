@@ -397,3 +397,84 @@ func Test_validateOrderIdentifiers(t *testing.T) {
 		})
 	}
 }
+
+func Test_challengeHistory_successRatio(t *testing.T) {
+	untried := challengeHistory{typeName: "untried"}
+	if got := untried.successRatio(); got != 0.5 {
+		t.Errorf("untried challenge type should have neutral smoothed ratio 0.5, got %f", got)
+	}
+
+	proven := challengeHistory{typeName: "proven", successes: 999, total: 1000}
+	if got := proven.successRatio(); got <= 0.5 {
+		t.Errorf("proven challenge type should outrank an untried one, got %f", got)
+	}
+
+	oneFailure := challengeHistory{typeName: "oneFailure", total: 1}
+	if got := oneFailure.successRatio(); got >= 0.5 {
+		t.Errorf("failed-once challenge type should rank below an untried one, got %f", got)
+	}
+
+	// a single failure must not sink a well-proven type to the bottom
+	proven.total++
+	if got := proven.successRatio(); got <= oneFailure.successRatio() {
+		t.Errorf("one failure should not rank a proven type below a failed-once type, got %f", got)
+	}
+}
+
+func Test_challengeStatsScopeIsolation(t *testing.T) {
+	// statistics for one CA/account scope must not leak into another
+	scopeA := challengeStatsScope{directory: "https://ca-a.example/dir", account: "acct-1"}
+	scopeB := challengeStatsScope{directory: "https://ca-b.example/dir", account: "acct-1"}
+	scopeC := challengeStatsScope{directory: "https://ca-a.example/dir", account: "acct-2"}
+
+	preferredChallengesMu.Lock()
+	defer preferredChallengesMu.Unlock()
+	preferredChallenges = make(map[challengeStatsScope]challengeTypes)
+
+	statsA := challengeTypes{{typeName: "http-01"}, {typeName: "dns-01"}}
+	statsA.increment("http-01", false)
+	preferredChallenges[scopeA] = statsA
+
+	for _, scope := range []challengeStatsScope{scopeB, scopeC} {
+		for _, ch := range preferredChallenges[scope] {
+			if ch.total != 0 {
+				t.Errorf("scope %+v should be unaffected by failures in another scope, got %+v", scope, ch)
+			}
+		}
+	}
+	for _, ch := range preferredChallenges[scopeA] {
+		if ch.typeName == "http-01" && ch.total != 1 {
+			t.Errorf("failure should be recorded in its own scope, got %+v", ch)
+		}
+	}
+}
+
+func Test_problemMayBeCausedByChallengeType(t *testing.T) {
+	retryable := []string{
+		acme.ProblemTypeIncorrectResponse,
+		acme.ProblemTypeConnection,
+		acme.ProblemTypeDNS,
+		acme.ProblemTypeTLS,
+		acme.ProblemTypeUnauthorized,
+		acme.ProblemTypeServerInternal,
+		"urn:ietf:params:acme:error:someFutureError",
+	}
+	for _, pt := range retryable {
+		if !problemMayBeCausedByChallengeType(pt) {
+			t.Errorf("problem type %s should be retryable with another challenge type", pt)
+		}
+	}
+
+	notRetryable := []string{
+		acme.ProblemTypeRateLimited,
+		acme.ProblemTypeRejectedIdentifier,
+		acme.ProblemTypeCAA,
+		acme.ProblemTypeMalformed,
+		acme.ProblemTypeBadCSR,
+	}
+	for _, pt := range notRetryable {
+		if problemMayBeCausedByChallengeType(pt) {
+			t.Errorf("problem type %s should not be retryable with another challenge type", pt)
+		}
+	}
+}
