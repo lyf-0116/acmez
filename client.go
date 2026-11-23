@@ -273,6 +273,10 @@ func (c *Client) getAuthzObjects(ctx context.Context, account acme.Account, orde
 		if err != nil {
 			return nil, fmt.Errorf("getting authorization at %s: %w", authzURL, err)
 		}
+		// Remember the state the authorization was in when we first saw it.
+		// A valid authorization may have been reused from an earlier order,
+		// in which case it must not be deactivated if this order fails.
+		authz.initialStatus = authz.Status
 
 		// add all offered challenge types to our memory if they
 		// aren't there already; we use this for statistics to
@@ -342,9 +346,15 @@ func (c *Client) solveChallenges(ctx context.Context, account acme.Account, orde
 		}
 
 		// if this function returns with an error, make sure to deactivate
-		// all pending or valid authorization objects so they don't "leak"
+		// the authorization objects this order created so they don't "leak"
 		// See: https://github.com/go-acme/lego/issues/383 and https://github.com/go-acme/lego/issues/353
 		for _, authz := range authzStates {
+			// Only authorizations that were pending when the order started
+			// were created for this order. Authorizations that were already
+			// valid were reused and remain available to future orders.
+			if authz.initialStatus != acme.StatusPending {
+				continue
+			}
 			if authz.Status != acme.StatusPending && authz.Status != acme.StatusValid {
 				continue
 			}
@@ -623,6 +633,7 @@ func (c *Client) enabledChallengeTypes() []string {
 type authzState struct {
 	acme.Authorization
 	account             acme.Account
+	initialStatus       string
 	currentChallenge    acme.Challenge
 	currentSolver       Solver
 	remainingChallenges []acme.Challenge

@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"log"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -81,6 +83,54 @@ func (h *httpSolver) CleanUp(context.Context, acme.Challenge) error {
 	return nil
 }
 
+type failingHTTPSolver struct {
+	failIdentifier string
+
+	mu          sync.Mutex
+	challenges  map[string]acme.Challenge
+	presentedBy map[string]int
+}
+
+// ServeHTTP implements http.Handler.
+func (h *failingHTTPSolver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	chal, ok := h.challenges[r.URL.Path]
+	h.mu.Unlock()
+	if !ok || r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Add("Content-Type", "text/plain")
+	w.Write([]byte(chal.KeyAuthorization))
+}
+
+// Present implements Solver.
+func (h *failingHTTPSolver) Present(_ context.Context, chal acme.Challenge) error {
+	h.mu.Lock()
+	h.presentedBy[chal.Identifier.Value]++
+	if chal.Identifier.Value == h.failIdentifier {
+		h.mu.Unlock()
+		return errors.New("intentional presentation failure")
+	}
+	h.challenges[chal.HTTP01ResourcePath()] = chal
+	h.mu.Unlock()
+	return nil
+}
+
+// CleanUp implements Solver.
+func (h *failingHTTPSolver) CleanUp(_ context.Context, chal acme.Challenge) error {
+	h.mu.Lock()
+	delete(h.challenges, chal.HTTP01ResourcePath())
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *failingHTTPSolver) presentations(identifier string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.presentedBy[identifier]
+}
+
 func TestAlreadyReplaced(t *testing.T) {
 	solverPort, solver := newHttpSolver(t)
 	client := newAcmeClient(t, solverPort, 0)
@@ -130,6 +180,56 @@ func TestAlreadyReplaced(t *testing.T) {
 		_, err = c.ObtainCertificate(t.Context(), params)
 		check.Equal(t, nil, err)
 	}
+}
+
+func TestReusedValidAuthorizationSurvivesFailedOrder(t *testing.T) {
+	t.Setenv("PEBBLE_AUTHZREUSE", "100")
+
+	solver := &failingHTTPSolver{
+		failIdentifier: "localhost",
+		challenges:     make(map[string]acme.Challenge),
+		presentedBy:    make(map[string]int),
+	}
+	solverServer := httptest.NewServer(solver)
+	t.Cleanup(solverServer.Close)
+	_, solverPort, err := net.SplitHostPort(solverServer.Listener.Addr().String())
+	check.Equal(t, nil, err)
+	port, err := strconv.Atoi(solverPort)
+	check.Equal(t, nil, err)
+
+	c := acmez.Client{
+		Client: newAcmeClient(t, port, 0),
+		ChallengeSolvers: map[string]acmez.Solver{
+			acme.ChallengeTypeHTTP01: solver,
+		},
+	}
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	check.Equal(t, nil, err)
+	account, err := c.NewAccount(t.Context(), acme.Account{
+		TermsOfServiceAgreed: true,
+		PrivateKey:           privateKey,
+	})
+	check.Equal(t, nil, err)
+
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	check.Equal(t, nil, err)
+	validIdentifier := "127.0.0.1"
+	_, err = c.ObtainCertificateForSANs(t.Context(), account, certKey, []string{validIdentifier})
+	check.Equal(t, nil, err)
+	validPresentations := solver.presentations(validIdentifier)
+
+	csr, err := acmez.NewCSR(certKey, []string{validIdentifier, solver.failIdentifier})
+	check.Equal(t, nil, err)
+	params, err := acmez.OrderParametersFromCSR(account, csr)
+	check.Equal(t, nil, err)
+	_, err = c.ObtainCertificate(t.Context(), params)
+	check.Equal(t, true, err != nil)
+
+	// The valid authorization was reused by the failed order. It must still be
+	// valid, so obtaining the certificate again should not need to present for it.
+	_, err = c.ObtainCertificateForSANs(t.Context(), account, certKey, []string{validIdentifier})
+	check.Equal(t, nil, err)
+	check.Equal(t, validPresentations, solver.presentations(validIdentifier))
 }
 
 func newAcmeClient(t *testing.T, httpPort, tlsPort int) *acme.Client {
