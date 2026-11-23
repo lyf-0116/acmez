@@ -201,6 +201,21 @@ func (c *Client) AccountKeyRollover(ctx context.Context, account Account, newPri
 		return account, fmt.Errorf("rolling key on server: %w", err)
 	}
 
+	// Converge local state with the server before committing the new key:
+	// a successful key-change response does not prove the server actually
+	// associated the new key with the account (the rollover may have
+	// partially failed, or a retry may have succeeded with the old key).
+	// Verify by fetching the account with a request signed by the new key,
+	// using the account URL as the kid (the jwk-to-kid switch that all
+	// subsequent requests will rely on). If this fails, keep the old key
+	// so the caller can retry the rollover instead of being permanently
+	// desynchronized from the server.
+	verifyAccount := account
+	verifyAccount.PrivateKey = newPrivateKey
+	if _, err := c.httpPostJWS(ctx, newPrivateKey, account.Location, account.Location, nil, &verifyAccount); err != nil {
+		return account, fmt.Errorf("verifying new account key (keeping old key; rollover is safe to retry): %w", err)
+	}
+
 	account.PrivateKey = newPrivateKey
 
 	return account, nil
