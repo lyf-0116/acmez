@@ -37,7 +37,10 @@ import (
 	"math/big"
 )
 
-var errUnsupportedKey = fmt.Errorf("unknown key type; only RSA and ECDSA are supported")
+var (
+	errUnsupportedKey = fmt.Errorf("unknown key type; only RSA and ECDSA are supported")
+	errNonceRequired  = fmt.Errorf("nonce is required")
+)
 
 // keyID is the account identity provided by a CA during registration.
 type keyID string
@@ -52,7 +55,7 @@ func jwsEncodeEAB(accountKey crypto.PublicKey, hmacKey []byte, kid keyID, url st
 	const alg = "HS256"
 
 	// §7.3.4: "The 'nonce' field MUST NOT be present"
-	phead, err := jwsHead(alg, "", url, kid, nil)
+	phead, err := jwsHeadWithoutNonce(alg, url, kid, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -82,14 +85,30 @@ func jwsEncodeEAB(accountKey crypto.PublicKey, hmacKey []byte, kid keyID, url st
 //
 // See https://tools.ietf.org/html/rfc7515#section-7.
 //
-// If nonce is empty, it will not be encoded into the header.
+// A non-empty nonce is required in the protected header of ordinary ACME
+// JWS objects (RFC 8555 §6.2). Protocol-defined nested JWS objects that must
+// omit it use jwsEncodeJSONWithoutNonce instead.
 func jwsEncodeJSON(claimset any, key crypto.Signer, kid keyID, nonce, url string) ([]byte, error) {
+	if nonce == "" {
+		return nil, fmt.Errorf("%w in JWS protected header", errNonceRequired)
+	}
+	return jwsEncodeJSONOptionalNonce(claimset, key, kid, nonce, url)
+}
+
+// jwsEncodeJSONWithoutNonce encodes a JWS that is required by the protocol to
+// omit the nonce header. This is only for the inner account key rollover JWS
+// defined by RFC 8555 §7.3.5; External Account Binding uses jwsEncodeEAB.
+func jwsEncodeJSONWithoutNonce(claimset any, key crypto.Signer, kid keyID, url string) ([]byte, error) {
+	return jwsEncodeJSONOptionalNonce(claimset, key, kid, "", url)
+}
+
+func jwsEncodeJSONOptionalNonce(claimset any, key crypto.Signer, kid keyID, nonce, url string) ([]byte, error) {
 	alg, sha := jwsHasher(key.Public())
 	if alg == "" || !sha.Available() {
 		return nil, errUnsupportedKey
 	}
 
-	phead, err := jwsHead(alg, nonce, url, kid, key)
+	phead, err := jwsHeadOptionalNonce(alg, nonce, url, kid, key)
 	if err != nil {
 		return nil, err
 	}
@@ -157,10 +176,25 @@ func jwkEncode(pub crypto.PublicKey) (string, error) {
 	return "", errUnsupportedKey
 }
 
-// jwsHead constructs the protected JWS header for the given fields.
-// Since jwk and kid are mutually-exclusive, the jwk will be encoded
-// only if kid is empty. If nonce is empty, it will not be encoded.
+// jwsHead constructs a protected JWS header with the required nonce field.
+// Since jwk and kid are mutually-exclusive, the jwk will be encoded only if
+// kid is empty.
 func jwsHead(alg, nonce, url string, kid keyID, key crypto.Signer) (string, error) {
+	if nonce == "" {
+		return "", fmt.Errorf("%w in JWS protected header", errNonceRequired)
+	}
+	return jwsHeadOptionalNonce(alg, nonce, url, kid, key)
+}
+
+// jwsHeadWithoutNonce constructs a protected JWS header without a nonce. It is
+// intended for protocol-defined JWS objects where RFC 8555 requires omission.
+func jwsHeadWithoutNonce(alg, url string, kid keyID, key crypto.Signer) (string, error) {
+	return jwsHeadOptionalNonce(alg, "", url, kid, key)
+}
+
+// jwsHeadOptionalNonce is the shared header encoder. Prefer jwsHead for
+// ordinary ACME requests and jwsHeadWithoutNonce for exempt nested JWSes.
+func jwsHeadOptionalNonce(alg, nonce, url string, kid keyID, key crypto.Signer) (string, error) {
 	phead := fmt.Sprintf(`{"alg":%q`, alg)
 	if kid == noKeyID {
 		jwk, err := jwkEncode(key.Public())

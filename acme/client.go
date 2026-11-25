@@ -148,7 +148,13 @@ func (c *Client) nonce(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("fetching new nonce from server: %w", err)
 	}
 
-	return resp.Header.Get(replayNonce), nil
+	nonce = resp.Header.Get(replayNonce)
+	if nonce == "" {
+		return "", fmt.Errorf("%w: missing or empty %s response header from %s",
+			errNonceRequired, replayNonce, c.dir.NewNonce)
+	}
+
+	return nonce, nil
 }
 
 func (c *Client) pollInterval() time.Duration {

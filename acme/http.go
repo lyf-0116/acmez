@@ -65,6 +65,9 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 			}
 		}
 
+		// Every outer ACME POST JWS requires a nonce. The protocol-defined
+		// exceptions are nested EAB and key-change JWSes; they use explicit
+		// no-nonce encoders instead of this path.
 		var nonce string // avoid shadowing err
 		nonce, err = c.nonce(ctx)
 		if err != nil {
@@ -74,7 +77,7 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 		var encodedPayload []byte // avoid shadowing err
 		encodedPayload, err = jwsEncodeJSON(input, privateKey, keyID(kid), nonce, endpoint)
 		if err != nil {
-			return nil, fmt.Errorf("encoding payload: %v", err)
+			return nil, fmt.Errorf("encoding payload: %w", err)
 		}
 
 		resp, err = c.httpReq(ctx, http.MethodPost, endpoint, encodedPayload, output)

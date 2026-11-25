@@ -191,7 +191,8 @@ func (c *Client) AccountKeyRollover(ctx context.Context, account Account, newPri
 		OldKey:  []byte(oldPublicKeyJWK),
 	}
 
-	innerJWS, err := jwsEncodeJSON(keyChangeReq, newPrivateKey, "", "", c.dir.KeyChange)
+	// RFC 8555 §7.3.5 requires the inner key-change JWS to omit nonce.
+	innerJWS, err := jwsEncodeJSONWithoutNonce(keyChangeReq, newPrivateKey, "", c.dir.KeyChange)
 	if err != nil {
 		return account, fmt.Errorf("encoding inner JWS: %v", err)
 	}
